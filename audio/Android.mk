@@ -8,6 +8,8 @@ LOCAL_SRC_FILES:= \
 	a2dp.c \
 	avdtp.c \
 	control.c \
+	avctp.c \
+	avrcp.c \
 	device.c \
 	gateway.c \
 	headset.c \
@@ -20,14 +22,23 @@ LOCAL_SRC_FILES:= \
 	source.c \
 	telephony-dummy.c \
 	transport.c \
-	unix.c
+	unix.c \
+	ste-qos.c
 
 LOCAL_CFLAGS:= \
 	-DVERSION=\"4.93\" \
 	-DSTORAGEDIR=\"/data/misc/bluetoothd\" \
 	-DCONFIGDIR=\"/etc/bluetooth\" \
 	-DANDROID \
-	-D__S_IFREG=0100000  # missing from bionic stat.h
+	-DNEED_G_SLIST_FREE_FULL \
+	-Wno-missing-field-initializers \
+	-Wno-pointer-arith \
+	-DDEBUG_SECTION=\"_audio\" \
+	-D__S_IFREG=0100000 # missing from bionic stat.h
+
+ifeq ($(filter $(BOARD_USES_LD_ANM),true),$(filter $(BOARD_BYPASSES_AUDIOFLINGER_A2DP),true false))
+LOCAL_CFLAGS += -DLD_ANM
+endif
 
 LOCAL_C_INCLUDES:= \
 	$(LOCAL_PATH)/../lib \
@@ -42,6 +53,7 @@ LOCAL_SHARED_LIBRARIES := \
 	libbluetoothd \
 	libbtio \
 	libdbus \
+	libutils \
 	libglib
 
 
@@ -50,6 +62,8 @@ LOCAL_UNSTRIPPED_PATH := $(TARGET_OUT_SHARED_LIBRARIES_UNSTRIPPED)/bluez-plugin
 LOCAL_MODULE := audio
 
 include $(BUILD_SHARED_LIBRARY)
+
+ifeq ($(BOARD_USES_LD_ANM),false)
 
 #
 # liba2dp
@@ -101,3 +115,67 @@ endif
 LOCAL_MODULE_TAGS := optional
 
 include $(BUILD_SHARED_LIBRARY)
+
+else
+
+#
+# ALSA plugins
+#
+
+# These should be LGPL code only
+
+#
+# bluez plugin to ALSA PCM
+#
+
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES:= pcm_bluetooth.c ipc.c
+
+LOCAL_CFLAGS:= -DPIC -D_POSIX_SOURCE -Wno-pointer-arith
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../../alsa-lib/include/
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../bluez/lib
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../sbc
+
+LOCAL_SHARED_LIBRARIES := libcutils libutils libasound
+LOCAL_STATIC_LIBRARIES := libsbc
+
+# don't prelink this library
+LOCAL_PRELINK_MODULE := false
+LOCAL_MODULE_PATH := $(TARGET_OUT)/usr/lib/alsa-lib
+LOCAL_UNSTRIPPED_PATH := $(TARGET_OUT_UNSTRIPPED)/usr/lib/alsa-lib
+LOCAL_MODULE := libasound_module_pcm_bluetooth
+LOCAL_MODULE_TAGS := optional
+
+include $(BUILD_SHARED_LIBRARY)
+
+
+#
+# bluez plugin to ALSA CTL
+#
+
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES:= ctl_bluetooth.c ipc.c
+
+LOCAL_CFLAGS:= -DPIC -D_POSIX_SOURCE -Wno-pointer-arith
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../../alsa-lib/include/
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../lib
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../sbc
+
+LOCAL_SHARED_LIBRARIES := libcutils libasound
+
+LOCAL_LDFLAGS := -module
+
+# don't prelink this library
+LOCAL_PRELINK_MODULE := false
+LOCAL_MODULE_PATH := $(TARGET_OUT)/usr/lib/alsa-lib
+LOCAL_UNSTRIPPED_PATH := $(TARGET_OUT_UNSTRIPPED)/usr/lib/alsa-lib
+LOCAL_MODULE := libasound_module_ctl_bluetooth
+LOCAL_MODULE_TAGS := optional
+
+include $(BUILD_SHARED_LIBRARY)
+
+endif

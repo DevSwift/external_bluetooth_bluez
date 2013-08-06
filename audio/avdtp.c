@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2012 Sony Mobile Communications AB
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -52,7 +53,7 @@
 #include "manager.h"
 #include "control.h"
 #include "avdtp.h"
-#include "glib-helper.h"
+#include "glib-compat.h"
 #include "btio.h"
 #include "sink.h"
 #include "source.h"
@@ -87,7 +88,7 @@
 
 #define REQ_TIMEOUT 6
 #define ABORT_TIMEOUT 2
-#define DISCONNECT_TIMEOUT 1
+#define DISCONNECT_TIMEOUT 5
 #define STREAM_TIMEOUT 20
 
 #if __BYTE_ORDER == __LITTLE_ENDIAN
@@ -1125,28 +1126,39 @@ static void finalize_discovery(struct avdtp *session, int err)
 static void release_stream(struct avdtp_stream *stream, struct avdtp *session)
 {
 	struct avdtp_local_sep *sep = stream->lsep;
-
-	if (sep->cfm && sep->cfm->abort &&
-				(sep->state != AVDTP_STATE_ABORTING ||
-							stream->abort_int))
-		sep->cfm->abort(session, sep, stream, NULL, sep->user_data);
+	avdtp_state_t prev_state = sep->state;
 
 	avdtp_sep_set_state(session, sep, AVDTP_STATE_IDLE);
+
+	if (sep->cfm && sep->cfm->abort &&
+				(prev_state != AVDTP_STATE_ABORTING ||
+							stream->abort_int))
+		sep->cfm->abort(session, sep, stream, NULL, sep->user_data);
+}
+
+static int avdtp_cancel_authorization(struct avdtp *session)
+{
+	struct audio_device *dev;
+
+	if (session->state != AVDTP_SESSION_STATE_CONNECTING)
+		return 0;
+
+	dev = manager_get_device(&session->server->src, &session->dst, FALSE);
+	if (dev == NULL)
+		return -ENODEV;
+
+	return audio_device_cancel_authorization(dev, auth_cb, session);
 }
 
 static void connection_lost(struct avdtp *session, int err)
 {
 	char address[18];
-	struct audio_device *dev;
 
 	ba2str(&session->dst, address);
 	DBG("Disconnected from %s", address);
 
-	dev = manager_get_device(&session->server->src, &session->dst, FALSE);
-
-	if (dev != NULL && session->state == AVDTP_SESSION_STATE_CONNECTING &&
-								err != EACCES)
-		audio_device_cancel_authorization(dev, auth_cb, session);
+	if (err != EACCES)
+		avdtp_cancel_authorization(session);
 
 	session->free_lock = 1;
 
@@ -1195,11 +1207,7 @@ void avdtp_unref(struct avdtp *session)
 	if (session->ref == 1) {
 		if (session->state == AVDTP_SESSION_STATE_CONNECTING &&
 								session->io) {
-			struct audio_device *dev;
-			dev = manager_get_device(&session->server->src,
-							&session->dst, FALSE);
-			audio_device_cancel_authorization(dev, auth_cb,
-								session);
+			avdtp_cancel_authorization(session);
 			g_io_channel_shutdown(session->io, TRUE, NULL);
 			g_io_channel_unref(session->io);
 			session->io = NULL;
@@ -1244,6 +1252,28 @@ struct avdtp *avdtp_ref(struct avdtp *session)
 	if (session->dc_timer)
 		remove_disconnect_timer(session);
 	return session;
+}
+
+struct avdtp *avdtp_get_session(struct avdtp_stream *stream)
+{
+	if (stream)
+		return stream->session;
+	return NULL;
+}
+
+uint16_t avdtp_get_delay(struct avdtp_stream *stream)
+{
+	if (stream)
+		return stream->delay;
+	return 0;
+}
+
+void avdtp_set_delay(struct avdtp_stream *stream, uint16_t delay)
+{
+	/* If delay reporting is supported do not set the value here since it is
+	already set in stream. */
+	if (stream && !stream->delay_reporting)
+		stream->delay = delay;
 }
 
 static struct avdtp_local_sep *find_local_sep_by_seid(struct avdtp_server *server,
@@ -1905,6 +1935,7 @@ static gboolean avdtp_delayreport_cmd(struct avdtp *session,
 	stream = sep->stream;
 
 	if (sep->state != AVDTP_STATE_CONFIGURED &&
+					sep->state != AVDTP_STATE_OPEN &&
 					sep->state != AVDTP_STATE_STREAMING) {
 		err = AVDTP_BAD_STATE;
 		goto failed;
@@ -2128,7 +2159,7 @@ static gboolean session_cb(GIOChannel *chan, GIOCondition cond,
 	}
 
 	if ((size_t) size < sizeof(struct avdtp_common_header)) {
-		error("Received too small packet (%zu bytes)", size);
+		error("Received too small packet (%lu bytes)", size);
 		goto failed;
 	}
 
@@ -2725,6 +2756,7 @@ static gboolean avdtp_discover_resp(struct avdtp *session,
 {
 	int sep_count, i;
 	uint8_t getcap_cmd;
+	int sep_inuse_count = 0;
 
 	if (session->version >= 0x0103 && session->server->version >= 0x0103)
 		getcap_cmd = AVDTP_GET_ALL_CAPABILITIES;
@@ -2747,8 +2779,10 @@ static gboolean avdtp_discover_resp(struct avdtp *session,
 
 		sep = find_remote_sep(session->seps, resp->seps[i].seid);
 		if (!sep) {
-			if (resp->seps[i].inuse && !stream)
+			if (resp->seps[i].inuse && !stream) {
+				sep_inuse_count++;
 				continue;
+			}
 			sep = g_new0(struct avdtp_remote_sep, 1);
 			session->seps = g_slist_append(session->seps, sep);
 		}
@@ -2768,6 +2802,11 @@ static gboolean avdtp_discover_resp(struct avdtp *session,
 			break;
 		}
 	}
+
+	/* if all sep are in use(it is not send get capabilities command);
+	 * call finalize discovery for disconnect the session */
+	if(sep_count == sep_inuse_count)
+		finalize_discovery(session, EIO);
 
 	return TRUE;
 }
@@ -3664,6 +3703,7 @@ int avdtp_delay_report(struct avdtp *session, struct avdtp_stream *stream,
 		return -EINVAL;
 
 	if (stream->lsep->state != AVDTP_STATE_CONFIGURED &&
+				stream->lsep->state != AVDTP_STATE_OPEN &&
 				stream->lsep->state != AVDTP_STATE_STREAMING)
 		return -EINVAL;
 

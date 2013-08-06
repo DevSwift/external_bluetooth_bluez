@@ -5,6 +5,7 @@
  *  Copyright (C) 2000-2001  Qualcomm Incorporated
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2012 Sony Mobile Communications AB.
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -29,6 +30,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +67,9 @@
 
 #define DEFAULT_DISCOVERABLE_TIMEOUT 180 /* 3 minutes */
 
+#define USB_VID_SYSFILE "/sys/class/android_usb/android0/idVendor"
+#define USB_PID_SYSFILE "/sys/class/android_usb/android0/idProduct"
+
 struct main_opts main_opts;
 
 static GKeyFile *load_config(const char *file)
@@ -86,12 +91,34 @@ static GKeyFile *load_config(const char *file)
 	return keyfile;
 }
 
+static uint16_t read_id(char *filename) {
+	int fd;
+	char buff[8];
+	uint16_t id;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		error("can't open id file: %s", filename);
+		return 0;
+	}
+	if (read(fd, buff, sizeof(buff)) < 1) {
+		error("can't read id file: %s", filename);
+		close(fd);
+		return 0;
+	}
+	close(fd);
+	id = (uint16_t)strtoul(buff, NULL, 16);
+
+	return id;
+}
+
 static void parse_config(GKeyFile *config)
 {
 	GError *err = NULL;
 	char *str;
 	int val;
 	gboolean boolean;
+	uint16_t vid = 0x0000, pid = 0x0000, ver = 0x0000;
 
 	if (!config)
 		return;
@@ -178,15 +205,15 @@ static void parse_config(GKeyFile *config)
 	} else
 		main_opts.remember_powered = boolean;
 
-	str = g_key_file_get_string(config, "General", "DeviceID", &err);
-	if (err) {
-		DBG("%s", err->message);
-		g_clear_error(&err);
-	} else {
-		DBG("deviceid=%s", str);
-		strncpy(main_opts.deviceid, str,
-					sizeof(main_opts.deviceid) - 1);
-		g_free(str);
+	/* Read Vender ID and Product ID from USB sys file
+	 * instead of config:DeviceID */
+	vid = read_id(USB_VID_SYSFILE);
+	pid = read_id(USB_PID_SYSFILE) & 0x0FFF;
+
+	if (vid && pid) {
+		snprintf(main_opts.deviceid, sizeof(main_opts.deviceid),
+				"%04X:%04X:%04X", vid, pid, ver);
+		DBG("deviceid=%s", main_opts.deviceid);
 	}
 
 	boolean = g_key_file_get_boolean(config, "General",

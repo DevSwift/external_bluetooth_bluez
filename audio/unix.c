@@ -4,6 +4,8 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2011 Sony Ericsson Mobile Communications AB
+ *  Copyright (C) 2012 ST-Ericsson SA
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -52,6 +54,8 @@
 #include "gateway.h"
 #include "unix.h"
 #include "glib-helper.h"
+#include "ste-qos.h"
+#include "glib-compat.h"
 
 #define check_nul(str) (str[sizeof(str) - 1] == '\0')
 
@@ -191,6 +195,14 @@ static void unix_ipc_error(struct unix_client *client, uint8_t name, int err)
 
 	DBG("sending error %s(%d)", strerror(err), err);
 	unix_ipc_sendmsg(client, &rsp->h);
+}
+
+static int unix_avdtp2posix_error_code(struct avdtp_error *err)
+{
+	if (err->category == AVDTP_ERRNO)
+		return err->err.posix_errno;
+	else
+		return err->err.error_code == AVDTP_BAD_STATE ? EAGAIN : EIO;
 }
 
 static service_type_t select_service(struct audio_device *dev, const char *interface)
@@ -523,7 +535,8 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
 				uint8_t seid,
 				uint8_t type,
 				uint8_t configured,
-				uint8_t lock)
+				uint8_t lock,
+				struct btd_device *device)
 {
 	struct avdtp_media_codec_capability *codec_cap = (void *) cap->data;
 	codec_capabilities_t *codec = (void *) rsp + rsp->h.length;
@@ -558,6 +571,7 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
 		sbc->block_length = sbc_cap->block_length;
 		sbc->min_bitpool = sbc_cap->min_bitpool;
 		sbc->max_bitpool = sbc_cap->max_bitpool;
+		ste_qos_clip_sbc_cap(device, sbc);
 
 		print_sbc(sbc_cap);
 	} else if (codec_cap->media_codec_type == A2DP_CODEC_MPEG12) {
@@ -693,7 +707,8 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
 		if (sep && a2dp_sep_get_lock(sep))
 			lock = BT_WRITE_LOCK;
 
-		a2dp_append_codec(rsp, cap, seid, type, configured, lock);
+		a2dp_append_codec(rsp, cap, seid, type, configured, lock,
+				client->dev->btd_dev);
 	}
 
 	unix_ipc_sendmsg(client, &rsp->h);
@@ -702,7 +717,7 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
 
 failed:
 	error("discovery failed");
-	unix_ipc_error(client, BT_GET_CAPABILITIES, EIO);
+	unix_ipc_error(client, BT_GET_CAPABILITIES, unix_avdtp2posix_error_code(err));
 
 	if (a2dp->sep) {
 		a2dp_sep_unlock(a2dp->sep, a2dp->session);
@@ -722,6 +737,7 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_set_configuration_rsp *rsp = (void *) buf;
+	struct bt_delay_report_ind ind;
 	struct a2dp_data *a2dp = &client->d.a2dp;
 	uint16_t imtu, omtu;
 	GSList *caps;
@@ -761,18 +777,28 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	client->cb_id = avdtp_stream_add_cb(session, stream,
 						stream_state_changed, client);
 
+	memset(&ind, 0, sizeof(ind));
+	ind.h.type = BT_INDICATION;
+	ind.h.name = BT_DELAY_REPORT;
+	ind.h.length = sizeof(ind);
+	ind.delay = avdtp_get_delay(stream);
+	unix_ipc_sendmsg(client, (void *) &ind);
+
 	return;
 
 failed:
 	error("config failed");
 
-	unix_ipc_error(client, BT_SET_CONFIGURATION, EIO);
+	unix_ipc_error(client, BT_SET_CONFIGURATION, unix_avdtp2posix_error_code(err));
+
+	if (a2dp->sep) {
+		a2dp_sep_unlock(a2dp->sep, a2dp->session);
+		a2dp->sep = NULL;
+	}
 
 	avdtp_unref(a2dp->session);
-
 	a2dp->session = NULL;
 	a2dp->stream = NULL;
-	a2dp->sep = NULL;
 }
 
 static void a2dp_resume_complete(struct avdtp *session,
@@ -811,7 +837,7 @@ static void a2dp_resume_complete(struct avdtp *session,
 failed:
 	error("resume failed");
 
-	unix_ipc_error(client, BT_START_STREAM, EIO);
+	unix_ipc_error(client, BT_START_STREAM, unix_avdtp2posix_error_code(err));
 
 	if (client->cb_id > 0) {
 		avdtp_stream_remove_cb(a2dp->session, a2dp->stream,
@@ -851,7 +877,7 @@ static void a2dp_suspend_complete(struct avdtp *session,
 failed:
 	error("suspend failed");
 
-	unix_ipc_error(client, BT_STOP_STREAM, EIO);
+	unix_ipc_error(client, BT_STOP_STREAM, unix_avdtp2posix_error_code(err));
 }
 
 static void start_discovery(struct audio_device *dev, struct unix_client *client)
@@ -1008,6 +1034,7 @@ static void start_config(struct audio_device *dev, struct unix_client *client)
 	struct a2dp_data *a2dp;
 	struct headset_data *hs;
 	unsigned int id;
+	gboolean free_caps = FALSE;
 
 	switch (client->type) {
 	case TYPE_SINK:
@@ -1029,6 +1056,12 @@ static void start_config(struct audio_device *dev, struct unix_client *client)
 
 		id = a2dp_config(a2dp->session, a2dp->sep, a2dp_config_complete,
 					client->caps, client);
+		/*
+		 * If errno is -EIO the caps (but not our local list) have been freed.
+		 * So note that we need to free the list.
+		 */
+		if (id == 0 && errno == -EIO)
+			free_caps = TRUE;
 		client->cancel = a2dp_cancel;
 		break;
 
@@ -1069,6 +1102,12 @@ static void start_config(struct audio_device *dev, struct unix_client *client)
 	return;
 
 failed:
+	if (free_caps && client->caps) {
+		g_slist_free(client->caps);
+		client->caps = NULL;
+		DBG("caps freed");
+	}
+
 	unix_ipc_error(client, BT_SET_CONFIGURATION, EIO);
 }
 
@@ -1870,7 +1909,7 @@ int unix_init(void)
 
 	int sk, err;
 
-	sk = socket(PF_LOCAL, SOCK_STREAM, 0);
+	sk = socket(PF_LOCAL, SOCK_SEQPACKET, 0);
 	if (sk < 0) {
 		err = errno;
 		error("Can't create unix socket: %s (%d)", strerror(err), err);

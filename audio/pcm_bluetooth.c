@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2012 ST-Ericsson SA
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -31,6 +31,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <sys/time.h>
+#include <utils/threads.h>
 #include <pthread.h>
 #include <signal.h>
 #include <limits.h>
@@ -44,18 +45,44 @@
 #include "sbc.h"
 #include "rtp.h"
 
-/* #define ENABLE_DEBUG */
+#define ENABLE_DEBUG          1
+#define ENABLE_VERBOSE_DEBUG  0
+
+#define WATCHER_TIMEOUT 1
+
+struct data_list {
+	struct bluetooth_data *data;
+	struct data_list *next;
+};
+
+static struct data_list *outstanding_data = NULL;
+static pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* timeout in seconds for command socket recv() */
+#define RECV_TIMEOUT			6
+
+#if defined(__BIONIC__) && defined(__GNUC__)
+/* Bionic doesn tag pthread_exit as a "return statement"
+ * which causes a compilation error with gcc
+ */
+void pthread_exit(void *value_ptr) __attribute__ ((__noreturn__));
+#endif
 
 #define UINT_SECS_MAX (UINT_MAX / 1000000 - 1)
 
 #define MIN_PERIOD_TIME 1
+#define ADJUST_RATE_FACTOR 50 /* 50 Hz */
 
-#define BUFFER_SIZE 2048
-
-#ifdef ENABLE_DEBUG
-#define DBG(fmt, arg...)  printf("DEBUG: %s: " fmt "\n" , __FUNCTION__ , ## arg)
+#if ENABLE_DEBUG == 1
+#define DBG(fmt, arg...)  printf("pcm_bluetooth: %s: " fmt "\n" , __FUNCTION__ , ## arg)
 #else
 #define DBG(fmt, arg...)
+#endif
+
+#if ENABLE_VERBOSE_DEBUG == 1
+#define DBGV(fmt, arg...)  printf("pcm_bluetooth: %s: " fmt "\n" , __FUNCTION__ , ## arg)
+#else
+#define DBGV(fmt, arg...)
 #endif
 
 #ifndef SOL_SCO
@@ -98,7 +125,7 @@ struct bluetooth_a2dp {
 	int sbc_initialized;			/* Keep track if the encoder is initialized */
 	unsigned int codesize;			/* SBC codesize */
 	int samples;				/* Number of encoded samples */
-	uint8_t buffer[BUFFER_SIZE];		/* Codec transfer buffer */
+	uint8_t *buffer;			/* Codec transfer buffer */
 	unsigned int count;			/* Codec transfer buffer counter */
 
 	int nsamples;				/* Cumulative number of codec samples */
@@ -126,6 +153,13 @@ struct bluetooth_alsa_config {
 	int autoconnect;
 };
 
+enum stream_state {
+	STREAM_CLOSED,
+	STREAM_OPENED,
+	STREAM_CONFIGURED,
+	STREAM_STARTED
+};
+
 struct bluetooth_data {
 	snd_pcm_ioplug_t io;
 	struct bluetooth_alsa_config alsa_config;	/* ALSA resource file parameters */
@@ -134,14 +168,24 @@ struct bluetooth_data {
 	unsigned int link_mtu;				/* MTU for selected transport channel */
 	volatile struct pollfd stream;			/* Audio stream filedescriptor */
 	struct pollfd server;				/* Audio daemon filedescriptor */
-	uint8_t buffer[BUFFER_SIZE];		/* Encoded transfer buffer */
+	uint8_t *buffer;				/* Encoded transfer buffer */
 	unsigned int count;				/* Transfer buffer counter */
 	struct bluetooth_a2dp a2dp;			/* A2DP data */
 
 	pthread_t hw_thread;				/* Makes virtual hw pointer move */
+#ifdef __BIONIC__
+	volatile int hw_cancel;				/* Set != 0 to request exit of hw_thread */
+#endif
 	int pipefd[2];					/* Inter thread communication */
 	int stopped;
 	sig_atomic_t reset;				/* Request XRUN handling */
+
+	pthread_t watcher;				/* Watcher thread */
+	int kill_watcher;				/* Used to sync threads */
+	pthread_cond_t cond;				/* Used to sync with Watcher */
+	pthread_mutex_t mut;				/* Used to sync with Watcher */
+	enum stream_state a2dp_stream_state;		/* Keeps A2dp stream state. */
+	long sink_delay;				/* Remote device delay in 1/10 milliseconds */
 };
 
 static int audioservice_send(int sk, const bt_audio_msg_header_t *msg);
@@ -150,16 +194,40 @@ static int audioservice_expect(int sk, bt_audio_msg_header_t *outmsg,
 
 static int bluetooth_start(snd_pcm_ioplug_t *io)
 {
-	DBG("bluetooth_start %p", io);
+	DBG("io state=%u", io->state);
 
 	return 0;
 }
 
 static int bluetooth_stop(snd_pcm_ioplug_t *io)
 {
-	DBG("bluetooth_stop %p", io);
+	DBG("io state=%u", io->state);
 
 	return 0;
+}
+
+static void update_delay(struct bluetooth_data *data)
+{
+	char buf[BT_SUGGESTED_BUFFER_SIZE];
+	struct bt_delay_report_ind *delay_ind = (void *) buf;
+	int err;
+	snd_pcm_sframes_t delayp;
+	snd_pcm_sframes_t availp;
+
+
+	delay_ind->h.length = sizeof(*delay_ind);
+	err = recv(data->server.fd, &delay_ind->h, delay_ind->h.length, MSG_PEEK);
+	if (err <= 0 || delay_ind->h.name != BT_DELAY_REPORT)
+		return;
+
+	err = recv(data->server.fd, &delay_ind->h, delay_ind->h.length, 0);
+	if (err < 0)
+		return;
+	data->sink_delay = delay_ind->delay;
+	DBG("Reported sink_delay=%li", data->sink_delay);
+
+	/* triggering delay callback from alsa */
+	snd_pcm_avail_delay(data->io.pcm, &availp, &delayp);
 }
 
 static void *playback_hw_thread(void *param)
@@ -171,6 +239,8 @@ static void *playback_hw_thread(void *param)
 	struct pollfd fds[2];
 	int poll_timeout;
 
+	androidSetThreadPriority(0, ANDROID_PRIORITY_AUDIO);
+
 	data->server.events = POLLIN;
 	/* note: only errors for data->stream.events */
 
@@ -178,7 +248,13 @@ static void *playback_hw_thread(void *param)
 	fds[1] = data->stream;
 
 	prev_periods = 0;
-	period_time = 1000000.0 * data->io.period_size / data->io.rate;
+	/*
+	* Lets increase a bit rate to make sure remote device will
+	* not get data too slow.
+	* Note that SBC is still codec with negotiated frequency.
+	*/
+	period_time = (1000000.0 * data->io.period_size)/
+				(data->io.rate + ADJUST_RATE_FACTOR);
 	if (period_time > (int) (MIN_PERIOD_TIME * 1000))
 		poll_timeout = (int) (period_time / 1000.0f);
 	else
@@ -195,7 +271,7 @@ static void *playback_hw_thread(void *param)
 			goto iter_sleep;
 
 		if (data->reset) {
-			DBG("Handle XRUN in hw-thread.");
+			DBG("Handle XRUN in hw-thread");
 			data->reset = 0;
 			clock_gettime(CLOCK_MONOTONIC, &start);
 			prev_periods = 0;
@@ -216,10 +292,23 @@ static void *playback_hw_thread(void *param)
 			data->hw_ptr %= data->io.buffer_size;
 
 			for (n = 0; n < frags; n++) {
+#ifdef __BIONIC__
+				/* write() should be a cancellation point,
+				 * emulate this here */
+				if (data->hw_cancel)
+					pthread_exit(NULL);
+#endif
+
 				/* Notify user that hardware pointer
 				 * has moved * */
+#ifdef __BIONIC__
+				write(data->pipefd[1], &c, 1);
+				if (data->hw_cancel)
+					pthread_exit(NULL);
+#else
 				if (write(data->pipefd[1], &c, 1) < 0)
 					pthread_testcancel();
+#endif
 			}
 
 			/* Reset point of reference to avoid too big values
@@ -244,13 +333,21 @@ iter_sleep:
 			}
 		} else if (ret > 0) {
 			ret = (fds[0].revents) ? 0 : 1;
-			SNDERR("poll fd %d revents %d", ret, fds[ret].revents);
+			SNDERR("poll fd %d, revents %d", ret, fds[ret].revents);
 			if (fds[ret].revents & (POLLERR | POLLHUP | POLLNVAL))
 				break;
+
+			if ((fds[0].revents & POLLIN))
+				update_delay(data);
 		}
 
 		/* Offer opportunity to be canceled by main thread */
+#ifdef __BIONIC__
+		if (data->hw_cancel)
+			pthread_exit(NULL);
+#else
 		pthread_testcancel();
+#endif
 	}
 
 	data->hw_thread = 0;
@@ -262,7 +359,8 @@ static int bluetooth_playback_start(snd_pcm_ioplug_t *io)
 	struct bluetooth_data *data = io->private_data;
 	int err;
 
-	DBG("%p", io);
+	DBG("previous stopped=%u, new stopped=0, io state=%u",
+			data->stopped, io->state);
 
 	data->stopped = 0;
 
@@ -278,7 +376,8 @@ static int bluetooth_playback_stop(snd_pcm_ioplug_t *io)
 {
 	struct bluetooth_data *data = io->private_data;
 
-	DBG("%p", io);
+	DBG("previous stopped=%u, new stopped=0, io state=%u",
+			data->stopped, io->state);
 
 	data->stopped = 1;
 
@@ -296,6 +395,9 @@ static void bluetooth_exit(struct bluetooth_data *data)
 {
 	struct bluetooth_a2dp *a2dp = &data->a2dp;
 
+	DBG("server.fd=0x%X stream.fd=0x%X",
+			data->server.fd, data->stream.fd);
+
 	if (data->server.fd >= 0)
 		bt_audio_service_close(data->server.fd);
 
@@ -303,8 +405,15 @@ static void bluetooth_exit(struct bluetooth_data *data)
 		close(data->stream.fd);
 
 	if (data->hw_thread) {
+#ifdef __BIONIC__
+		data->hw_cancel = 1;
+#else
 		pthread_cancel(data->hw_thread);
+#endif
 		pthread_join(data->hw_thread, 0);
+#ifdef __BIONIC__
+		data->hw_cancel = 0;
+#endif
 	}
 
 	if (a2dp->sbc_initialized)
@@ -316,15 +425,160 @@ static void bluetooth_exit(struct bluetooth_data *data)
 	if (data->pipefd[1] > 0)
 		close(data->pipefd[1]);
 
+	free(data->buffer);
+	free(a2dp->buffer);
 	free(data);
+}
+
+static int add_outstanding_data(struct bluetooth_data *data){
+
+	struct data_list *n_elem;
+
+	DBG("");
+
+	n_elem = malloc(sizeof(struct data_list));
+	if (!n_elem)
+		return -1;
+
+	pthread_mutex_lock(&list_mutex);
+
+	/* Adding element to the start of the list. */
+	n_elem->data = data;
+	n_elem->next = outstanding_data;
+	outstanding_data = n_elem;
+
+	pthread_mutex_unlock(&list_mutex);
+
+	return 0;
+}
+
+static void remove_outstanding_data(struct bluetooth_data *data) {
+
+	struct data_list *elem = NULL;
+	struct data_list *elem_next;
+
+	DBG("");
+
+	pthread_mutex_lock(&list_mutex);
+
+	elem_next = outstanding_data;
+	while (elem_next) {
+		if (elem_next->data == data) {
+			if (elem)
+				elem->next = elem_next->next;
+			else
+				outstanding_data = elem_next->next;
+
+			free(elem_next);
+			goto unlock;
+		}
+
+		elem = elem_next;
+		elem_next = elem_next->next;
+	}
+
+	DBG("Data not found");
+
+unlock:
+	pthread_mutex_unlock(&list_mutex);
+
+}
+
+static void *bluetooth_watcher(void *param)
+{
+	struct bluetooth_data *data = (struct bluetooth_data *)param;
+	struct timeval now;
+	struct timespec timeout;
+	int timer_expired = 0;
+
+	DBG("");
+
+	gettimeofday(&now, NULL);
+
+	/* Set absolute time.*/
+	timeout.tv_sec = now.tv_sec + WATCHER_TIMEOUT;
+	timeout.tv_nsec= now.tv_usec * 1000;
+
+	pthread_mutex_lock(&data->mut);
+
+	while (data->kill_watcher == 0 &&
+		ETIMEDOUT != pthread_cond_timedwait(&data->cond,
+						&data->mut, &timeout))
+		;
+
+	if (data->kill_watcher == 0)
+		timer_expired = 1;
+	else
+		data->kill_watcher = 0;
+
+	pthread_mutex_unlock(&data->mut);
+
+	if (timer_expired) {
+		/* Timeout. Clean old data. */
+		remove_outstanding_data(data);
+		bluetooth_exit(data);
+	} else {
+		data->watcher = 0;
+	}
+
+	pthread_exit(NULL);
+}
+
+static void bluetooth_kill_watcher(struct bluetooth_data *data){
+
+	/* Kill watcher thread. */
+	pthread_mutex_lock(&data->mut);
+	data->kill_watcher = 1;
+	pthread_cond_signal(&data->cond);
+	pthread_mutex_unlock(&data->mut);
 }
 
 static int bluetooth_close(snd_pcm_ioplug_t *io)
 {
 	struct bluetooth_data *data = io->private_data;
+	int err;
 
-	DBG("%p", io);
+	/*
+	* It might happen that Close is due to e.g music forward.
+	* In that case we  do not need to SUSPEND and START
+	* stream if configuration does not change.
+	* Lets wait 2 sec to see if alsa plugin will open again.
+	* Then we assume music forward scenario.
+	* If music configuration changed, client will take care
+	* for reconfiguration.
+	*/
+	if (data->watcher < 0)
+		goto close;
 
+	/*
+	* Keep data in outstanding_data for reference.
+	* Will need it if client open plugin again.
+	*/
+	if (add_outstanding_data(data) < 0) {
+		SNDERR("Could not add data and start watcher");
+		goto close;
+	}
+
+	err = pthread_create(&data->watcher, 0,
+			bluetooth_watcher, data);
+	if (err)
+		goto remove_close;
+
+	err = pthread_detach(data->watcher);
+	if (err) {
+		SNDERR("Could not detach pthread. Kill watcher.");
+		goto kill_close;
+	}
+
+	/* Watcher thread succesfully run. */
+	DBG("Start Watcher");
+	return 0;
+
+kill_close:
+	bluetooth_kill_watcher(data);
+remove_close:
+	remove_outstanding_data(data);
+close:
 	bluetooth_exit(data);
 
 	return 0;
@@ -350,8 +604,15 @@ static int bluetooth_prepare(snd_pcm_ioplug_t *io)
 	/* As we're gonna receive messages on the server socket, we have to stop the
 	   hw thread that is polling on it, if any */
 	if (data->hw_thread) {
+#ifdef __BIONIC__
+		data->hw_cancel = 1;
+#else
 		pthread_cancel(data->hw_thread);
+#endif
 		pthread_join(data->hw_thread, 0);
+#ifdef __BIONIC__
+		data->hw_cancel = 0;
+#endif
 		data->hw_thread = 0;
 	}
 
@@ -363,6 +624,11 @@ static int bluetooth_prepare(snd_pcm_ioplug_t *io)
 		/* ALSA library is really picky on the fact hw_ptr is not null.
 		 * If it is, capture won't start */
 		data->hw_ptr = io->period_size;
+
+	if (data->a2dp_stream_state == STREAM_STARTED){
+		DBG("Stream is already started");
+		goto done;
+	}
 
 	/* send start */
 	memset(req, 0, BT_SUGGESTED_BUFFER_SIZE);
@@ -377,8 +643,18 @@ static int bluetooth_prepare(snd_pcm_ioplug_t *io)
 	rsp->h.length = sizeof(*rsp);
 	err = audioservice_expect(data->server.fd, &rsp->h,
 					BT_START_STREAM);
-	if (err < 0)
+	if (err < 0) {
+		/*
+		 * When receiving an error, BlueZ will always close the endpoint
+		 * implicitly (see audio/unix.c). But upon retry the audio system
+		 * won't close pcm_bluetooth before the retry.
+		 * So assure that we will reopen stream upon retry (which will
+		 * reopen the endpoint as well).
+		 */
+		if (err == -EAGAIN)
+			data->a2dp_stream_state = STREAM_CLOSED;
 		return err;
+	}
 
 	ind->h.length = sizeof(*ind);
 	err = audioservice_expect(data->server.fd, &ind->h,
@@ -419,6 +695,9 @@ static int bluetooth_prepare(snd_pcm_ioplug_t *io)
 		/* FIXME : handle error codes */
 	}
 
+	/* Stream is started now. */
+	data->a2dp_stream_state = STREAM_STARTED;
+done:
 	/* wake up any client polling at us */
 	err = write(data->pipefd[1], &c, 1);
 	if (err < 0)
@@ -431,11 +710,13 @@ static int bluetooth_hsp_hw_params(snd_pcm_ioplug_t *io,
 					snd_pcm_hw_params_t *params)
 {
 	struct bluetooth_data *data = io->private_data;
+	struct bluetooth_a2dp *a2dp = &data->a2dp;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_open_req *open_req = (void *) buf;
 	struct bt_open_rsp *open_rsp = (void *) buf;
 	struct bt_set_configuration_req *req = (void *) buf;
 	struct bt_set_configuration_rsp *rsp = (void *) buf;
+	struct bt_delay_report_ind *ind_delay = (void *) buf;
 	int err;
 
 	DBG("Preparing with io->period_size=%lu io->buffer_size=%lu",
@@ -484,6 +765,24 @@ static int bluetooth_hsp_hw_params(snd_pcm_ioplug_t *io,
 	data->transport = BT_CAPABILITIES_TRANSPORT_SCO;
 	data->link_mtu = rsp->link_mtu;
 
+	data->buffer = realloc(data->buffer, data->link_mtu);
+	a2dp->buffer = realloc(a2dp->buffer, data->link_mtu);
+	if (!data->buffer || !a2dp->buffer) {
+		free(data->buffer);
+		free(a2dp->buffer);
+		data->buffer = NULL;
+		a2dp->buffer = NULL;
+		return -ENOMEM;
+	}
+
+	ind_delay->h.length = sizeof(*ind_delay);
+	err = audioservice_expect(data->server.fd, &ind_delay->h,
+					BT_DELAY_REPORT);
+	if (err < 0)
+		return err;
+
+	data->sink_delay = ind_delay->delay;
+
 	return 0;
 }
 
@@ -523,6 +822,27 @@ static uint8_t default_bitpool(uint8_t freq, uint8_t mode)
 	}
 }
 
+static int bluetooth_convert_rate_to_a2dp(unsigned int rate, uint8_t *out_rate) {
+	switch (rate) {
+	case 48000:
+		*out_rate = BT_SBC_SAMPLING_FREQ_48000;
+		break;
+	case 44100:
+		*out_rate = BT_SBC_SAMPLING_FREQ_44100;
+		break;
+	case 32000:
+		*out_rate = BT_SBC_SAMPLING_FREQ_32000;
+		break;
+	case 16000:
+		*out_rate = BT_SBC_SAMPLING_FREQ_16000;
+		break;
+	default:
+		DBG("Rate %d not supported", rate);
+		return -1;
+	}
+	return 0;
+}
+
 static int bluetooth_a2dp_init(struct bluetooth_data *data,
 					snd_pcm_hw_params_t *params)
 {
@@ -534,23 +854,8 @@ static int bluetooth_a2dp_init(struct bluetooth_data *data,
 	snd_pcm_hw_params_get_rate(params, &rate, &dir);
 	snd_pcm_hw_params_get_channels(params, &channels);
 
-	switch (rate) {
-	case 48000:
-		cap->frequency = BT_SBC_SAMPLING_FREQ_48000;
-		break;
-	case 44100:
-		cap->frequency = BT_SBC_SAMPLING_FREQ_44100;
-		break;
-	case 32000:
-		cap->frequency = BT_SBC_SAMPLING_FREQ_32000;
-		break;
-	case 16000:
-		cap->frequency = BT_SBC_SAMPLING_FREQ_16000;
-		break;
-	default:
-		DBG("Rate %d not supported", rate);
+	if (bluetooth_convert_rate_to_a2dp(rate, &cap->frequency) < 0)
 		return -1;
-	}
 
 	if (cfg->has_channel_mode)
 		cap->channel_mode = cfg->channel_mode;
@@ -686,45 +991,135 @@ static void bluetooth_a2dp_setup(struct bluetooth_a2dp *a2dp)
 	a2dp->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
 }
 
-static int bluetooth_a2dp_hw_params(snd_pcm_ioplug_t *io,
-					snd_pcm_hw_params_t *params)
+
+static int stream_open(struct bluetooth_data *data)
 {
-	struct bluetooth_data *data = io->private_data;
-	struct bluetooth_a2dp *a2dp = &data->a2dp;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_open_req *open_req = (void *) buf;
 	struct bt_open_rsp *open_rsp = (void *) buf;
-	struct bt_set_configuration_req *req = (void *) buf;
-	struct bt_set_configuration_rsp *rsp = (void *) buf;
-	int err;
+	struct bluetooth_a2dp *a2dp = &data->a2dp;
+	int err = 0;
 
-	DBG("Preparing with io->period_size=%lu io->buffer_size=%lu",
-					io->period_size, io->buffer_size);
-
-	memset(req, 0, BT_SUGGESTED_BUFFER_SIZE);
+	memset(open_req, 0, BT_SUGGESTED_BUFFER_SIZE);
 	open_req->h.type = BT_REQUEST;
 	open_req->h.name = BT_OPEN;
 	open_req->h.length = sizeof(*open_req);
 
 	strncpy(open_req->destination, data->alsa_config.device, 18);
 	open_req->seid = a2dp->sbc_capabilities.capability.seid;
-	open_req->lock = (io->stream == SND_PCM_STREAM_PLAYBACK ?
+	open_req->lock = (data->io.stream == SND_PCM_STREAM_PLAYBACK ?
 			BT_WRITE_LOCK : BT_READ_LOCK);
 
 	err = audioservice_send(data->server.fd, &open_req->h);
 	if (err < 0)
-		return err;
+		goto done;
 
 	open_rsp->h.length = sizeof(*open_rsp);
 	err = audioservice_expect(data->server.fd, &open_rsp->h,
 					BT_OPEN);
+
+done:
+	return err;
+
+}
+
+static int bluetooth_configuration_cmp(struct bluetooth_data *data,
+					snd_pcm_hw_params_t *params)
+
+{
+	struct bluetooth_alsa_config *cfg = &data->alsa_config;
+	sbc_capabilities_t *cap = &data->a2dp.sbc_capabilities;
+	unsigned int rate ;
+	int dir;
+	uint8_t a2dp_rate;
+
+	DBG("");
+
+	snd_pcm_hw_params_get_rate(params, &rate, &dir);
+
+	if (bluetooth_convert_rate_to_a2dp(rate, &a2dp_rate) < 0) {
+		SNDERR("Could not get a2dp rate");
+		return -1;
+	}
+
+	if (cap->frequency != a2dp_rate) {
+		DBG("New frequency %d", a2dp_rate);
+		return -1;
+	}
+
+	/* Bitpool. */
+	if (cfg->has_bitpool &&
+		(cap->max_bitpool != cfg->bitpool ||
+		cap->min_bitpool != cfg->bitpool)) {
+		DBG("New bitpool %d", cfg->bitpool);
+		return -1;
+	}
+
+	/* Subbands. */
+	if (cfg->has_subbands &&
+		!(cfg->subbands & cap->subbands)) {
+		DBG("New subbands %d", cfg->subbands);
+		return -1;
+	}
+
+	/* Allocation method. */
+	if (cfg->has_allocation_method &&
+		!(cfg->allocation_method & cap->allocation_method)) {
+		DBG("New allocation method %d", cfg->allocation_method);
+		return -1;
+	}
+
+	/* Block Lenght. */
+	if (cfg->has_block_length &&
+		!(cfg->block_length & cap->block_length)) {
+		DBG("New block lenght %d", cfg->block_length);
+		return -1;
+	}
+
+	/* Channel mode. */
+	if (cfg->has_channel_mode &&
+		!(cfg->channel_mode & cap->channel_mode)) {
+		DBG("New channel mode %d", cfg->channel_mode);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int bluetooth_a2dp_hw_params(snd_pcm_ioplug_t *io,
+					snd_pcm_hw_params_t *params)
+{
+	struct bluetooth_data *data = io->private_data;
+	struct bluetooth_a2dp *a2dp = &data->a2dp;
+	char buf[BT_SUGGESTED_BUFFER_SIZE];
+	struct bt_set_configuration_req *req = (void *) buf;
+	struct bt_set_configuration_rsp *rsp = (void *) buf;
+	struct bt_delay_report_ind *ind_delay = (void *) buf;
+	int err;
+
+	DBG("Preparing with io->period_size=%lu io->buffer_size=%lu",
+					io->period_size, io->buffer_size);
+
+	if (data->a2dp_stream_state != STREAM_CLOSED) {
+		DBG("Stream is already open");
+		/* Check if new configuration is needed. */
+		if (bluetooth_configuration_cmp(data, params))
+			goto configure;
+		else
+			return 0;
+	}
+
+	err = stream_open(data);
 	if (err < 0)
 		return err;
+
+	data->a2dp_stream_state = STREAM_OPENED;
 
 	err = bluetooth_a2dp_init(data, params);
 	if (err < 0)
 		return err;
 
+configure:
 	memset(req, 0, BT_SUGGESTED_BUFFER_SIZE);
 	req->h.type = BT_REQUEST;
 	req->h.name = BT_SET_CONFIGURATION;
@@ -750,12 +1145,32 @@ static int bluetooth_a2dp_hw_params(snd_pcm_ioplug_t *io,
 	data->transport = BT_CAPABILITIES_TRANSPORT_A2DP;
 	data->link_mtu = rsp->link_mtu;
 
+	data->buffer = realloc(data->buffer, data->link_mtu);
+	a2dp->buffer = realloc(a2dp->buffer, data->link_mtu);
+	if (!data->buffer || !a2dp->buffer) {
+		free(data->buffer);
+		free(a2dp->buffer);
+		data->buffer = NULL;
+		a2dp->buffer = NULL;
+		return -ENOMEM;
+	}
+
+	ind_delay->h.length = sizeof(*ind_delay);
+	err = audioservice_expect(data->server.fd, &ind_delay->h,
+					BT_DELAY_REPORT);
+	if (err < 0)
+		return err;
+
+	data->sink_delay = ind_delay->delay;
+
 	/* Setup SBC encoder now we agree on parameters */
 	bluetooth_a2dp_setup(a2dp);
 
-	DBG("\tallocation=%u\n\tsubbands=%u\n\tblocks=%u\n\tbitpool=%u\n",
+	DBG("allocation=%u subbands=%u blocks=%u bitpool=%u sink_delay=%li\n",
 		a2dp->sbc.allocation, a2dp->sbc.subbands, a2dp->sbc.blocks,
-		a2dp->sbc.bitpool);
+		a2dp->sbc.bitpool, data->sink_delay);
+
+	data->a2dp_stream_state = STREAM_CONFIGURED;
 
 	return 0;
 }
@@ -798,7 +1213,7 @@ static int bluetooth_playback_poll_descriptors(snd_pcm_ioplug_t *io,
 {
 	struct bluetooth_data *data = io->private_data;
 
-	DBG("");
+	DBGV("space=%u", space);
 
 	assert(data->pipefd[0] >= 0);
 
@@ -821,7 +1236,7 @@ static int bluetooth_playback_poll_revents(snd_pcm_ioplug_t *io,
 {
 	static char buf[1];
 
-	DBG("");
+	DBGV("nfds=%u revents=0x%04X", nfds, (unsigned int) revents);
 
 	assert(pfds);
 	assert(nfds == 2);
@@ -833,10 +1248,15 @@ static int bluetooth_playback_poll_revents(snd_pcm_ioplug_t *io,
 		if (read(pfds[0].fd, buf, 1) < 0)
 			SYSERR("read error: %s (%d)", strerror(errno), errno);
 
+	/* Alsa lib does not check for POLLHUP */
+	if (pfds[1].revents & POLLHUP)
+		pfds[1].revents = (pfds[1].revents | POLLERR);
+
 	if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL))
 		io->state = SND_PCM_STATE_DISCONNECTED;
 
-	*revents = (pfds[0].revents & POLLIN) ? POLLOUT : 0;
+	revents[0] = (pfds[0].revents & POLLIN) ? POLLOUT : 0;
+	revents[1] = pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL);
 
 	return 0;
 }
@@ -911,7 +1331,7 @@ static snd_pcm_sframes_t bluetooth_hsp_write(snd_pcm_ioplug_t *io,
 	uint8_t *buff;
 	int rsend, frame_size;
 
-	DBG("areas->step=%u areas->first=%u offset=%lu, size=%lu io->nonblock=%u",
+	DBGV("areas->step=%u areas->first=%u offset=%lu, size=%lu io->nonblock=%u",
 			areas->step, areas->first, offset, size, io->nonblock);
 
 	if (io->hw_ptr > io->appl_ptr) {
@@ -927,7 +1347,7 @@ static snd_pcm_sframes_t bluetooth_hsp_write(snd_pcm_ioplug_t *io,
 	else
 		frames_to_read = (data->link_mtu - data->count) / frame_size;
 
-	DBG("count=%d frames_to_read=%lu", data->count, frames_to_read);
+	DBGV("count=%d frames_to_read=%lu", data->count, frames_to_read);
 
 	/* Ready for more data */
 	buff = (uint8_t *) areas->addr +
@@ -954,7 +1374,7 @@ static snd_pcm_sframes_t bluetooth_hsp_write(snd_pcm_ioplug_t *io,
 		ret = -EIO;
 
 done:
-	DBG("returning %ld", ret);
+	DBGV("returning %ld", ret);
 	return ret;
 }
 
@@ -972,6 +1392,8 @@ static int avdtp_write(struct bluetooth_data *data)
 	struct rtp_header *header;
 	struct rtp_payload *payload;
 	struct bluetooth_a2dp *a2dp = &data->a2dp;
+	int retpoll = 0;
+	struct pollfd poll_stream;
 
 	header = (void *) a2dp->buffer;
 	payload = (void *) (a2dp->buffer + sizeof(*header));
@@ -985,10 +1407,24 @@ static int avdtp_write(struct bluetooth_data *data)
 	header->timestamp = htonl(a2dp->nsamples);
 	header->ssrc = htonl(1);
 
-	ret = send(data->stream.fd, a2dp->buffer, a2dp->count, MSG_DONTWAIT);
-	if (ret < 0) {
-		DBG("send returned %d errno %s.", ret, strerror(errno));
-		ret = -errno;
+	/* Check for overrun before sending*/
+	poll_stream.fd = data->stream.fd;
+	poll_stream.events = POLLOUT;
+
+	retpoll = poll(&poll_stream, 1, 0);
+	if ((poll_stream.revents & POLLOUT)){
+		ret = send(data->stream.fd, a2dp->buffer, a2dp->count, MSG_DONTWAIT);
+		if (ret < 0) {
+			DBG("send returned %d, errno %s", ret, strerror(errno));
+			ret = -errno;
+		}
+	} else {
+		if (retpoll < 0) {
+			DBG("poll returned %d, errno %s", retpoll, strerror(errno));
+			ret = -errno;
+		} else {
+			DBG("overrun, socket is full audio data dropped");
+		}
 	}
 
 	/* Reset buffer of data to send */
@@ -1012,10 +1448,9 @@ static snd_pcm_sframes_t bluetooth_a2dp_write(snd_pcm_ioplug_t *io,
 	ssize_t written;
 	uint8_t *buff;
 
-	DBG("areas->step=%u areas->first=%u offset=%lu size=%lu",
-				areas->step, areas->first, offset, size);
-	DBG("hw_ptr=%lu appl_ptr=%lu diff=%lu", io->hw_ptr, io->appl_ptr,
-			io->appl_ptr - io->hw_ptr);
+	DBGV("areas->step=%u areas->first=%u offset=%lu size=%lu hw_ptr=%lu appl_ptr=%lu diff=%lu",
+				areas->step, areas->first, offset, size, io->hw_ptr,
+				io->appl_ptr, io->appl_ptr - io->hw_ptr);
 
 	/* Calutate starting pointers */
 	frame_size = areas->step / 8;
@@ -1064,7 +1499,7 @@ static snd_pcm_sframes_t bluetooth_a2dp_write(snd_pcm_ioplug_t *io,
 		/* Enough data to encode (sbc wants 1k blocks) */
 		encoded = sbc_encode(&a2dp->sbc, data->buffer, a2dp->codesize,
 					a2dp->buffer + a2dp->count,
-					sizeof(a2dp->buffer) - a2dp->count,
+					data->link_mtu - a2dp->count,
 								&written);
 		if (encoded <= 0) {
 			DBG("Encoding error %d", encoded);
@@ -1080,7 +1515,7 @@ static snd_pcm_sframes_t bluetooth_a2dp_write(snd_pcm_ioplug_t *io,
 		/* No space left for another frame then send */
 		if (a2dp->count + written >= data->link_mtu) {
 			avdtp_write(data);
-			DBG("sending packet %d, count %d, link_mtu %u",
+			DBGV("sending packet %d, count %d, link_mtu %u",
 					a2dp->seq_num, a2dp->count,
 							data->link_mtu);
 		}
@@ -1100,7 +1535,7 @@ static snd_pcm_sframes_t bluetooth_a2dp_write(snd_pcm_ioplug_t *io,
 		/* Enough data to encode (sbc wants 1k blocks) */
 		encoded = sbc_encode(&a2dp->sbc, buff, a2dp->codesize,
 					a2dp->buffer + a2dp->count,
-					sizeof(a2dp->buffer) - a2dp->count,
+					data->link_mtu - a2dp->count,
 								&written);
 		if (encoded <= 0) {
 			DBG("Encoding error %d", encoded);
@@ -1121,7 +1556,7 @@ static snd_pcm_sframes_t bluetooth_a2dp_write(snd_pcm_ioplug_t *io,
 		/* No space left for another frame then send */
 		if (a2dp->count + written >= data->link_mtu) {
 			avdtp_write(data);
-			DBG("sending packet %d, count %d, link_mtu %u",
+			DBGV("sending packet %d, count %d, link_mtu %u",
 						a2dp->seq_num, a2dp->count,
 							data->link_mtu);
 		}
@@ -1136,7 +1571,7 @@ out:
 	}
 
 done:
-	DBG("returning %ld", size - bytes_left / frame_size);
+	DBGV("returning %ld", size - bytes_left / frame_size);
 
 	return size - bytes_left / frame_size;
 }
@@ -1144,12 +1579,21 @@ done:
 static int bluetooth_playback_delay(snd_pcm_ioplug_t *io,
 					snd_pcm_sframes_t *delayp)
 {
-	DBG("");
+	struct bluetooth_data *data = io->private_data;
 
 	/* This updates io->hw_ptr value using pointer() function */
 	snd_pcm_hwsync(io->pcm);
 
 	*delayp = io->appl_ptr - io->hw_ptr;
+
+	/* Add sink delay, it resolution is 0.1ms and convert it to
+	 * number of PCM frames using stream rate; example for 250ms of delay
+	 * 2500 * 48000 / 1000 / 10 = 12000 frames of delay */
+	*delayp += data->sink_delay * io->rate / 10000;
+
+	DBG("Update playback delay to sink_delay=%li, delayp=%li",
+		data->sink_delay, (long) *delayp);
+
 	if ((io->state == SND_PCM_STATE_RUNNING) && (*delayp < 0)) {
 		io->callback->stop(io);
 		io->state = SND_PCM_STATE_XRUN;
@@ -1558,12 +2002,28 @@ static int audioservice_recv(int sk, bt_audio_msg_header_t *inmsg)
 	ssize_t ret;
 	const char *type, *name;
 	uint16_t length;
+	uint16_t rec_len;
+	bt_audio_error_t error_rsp;
+	bt_audio_msg_header_t *rsp;
 
 	length = inmsg->length ? inmsg->length : BT_SUGGESTED_BUFFER_SIZE;
 
+	/*
+	 * We must always be ready to receive an error message.
+	 * If input buffer is smaller than an error message receive it
+	 * in an error message structure instead.
+	 */
+	if (length >= sizeof(error_rsp)) {
+		rec_len = length;
+		rsp = inmsg;
+	} else {
+		rsp = (bt_audio_msg_header_t*)&error_rsp;
+		rec_len = sizeof(error_rsp);
+	}
+
 	DBG("trying to receive msg from audio service...");
 
-	ret = recv(sk, inmsg, length, 0);
+	ret = recv(sk, rsp, rec_len, 0);
 	if (ret < 0) {
 		err = -errno;
 		SNDERR("Error receiving IPC data from bluetoothd: %s (%d)",
@@ -1571,9 +2031,22 @@ static int audioservice_recv(int sk, bt_audio_msg_header_t *inmsg)
 	} else if ((size_t) ret < sizeof(bt_audio_msg_header_t)) {
 		SNDERR("Too short (%d bytes) IPC packet from bluetoothd", ret);
 		err = -EINVAL;
+	} else if (rsp->type == BT_ERROR) {
+		bt_audio_error_t *error = (bt_audio_error_t*)rsp;
+		if (ret < (ssize_t)sizeof(*error)) {
+			SNDERR("Received too few bytes (%d) for BT_ERROR packet for %s",
+					ret, bt_audio_strname(rsp->name));
+			err = -EINVAL;
+			goto finished;
+		}
+		SNDERR("%s failed : %s(%d)",
+				bt_audio_strname(rsp->name),
+				strerror(error->posix_errno),
+				error->posix_errno);
+		err = -error->posix_errno;
 	} else {
-		type = bt_audio_strtype(inmsg->type);
-		name = bt_audio_strname(inmsg->name);
+		type = bt_audio_strtype(rsp->type);
+		name = bt_audio_strname(rsp->name);
 		if (type && name) {
 			DBG("Received %s - %s", type, name);
 			err = 0;
@@ -1581,10 +2054,18 @@ static int audioservice_recv(int sk, bt_audio_msg_header_t *inmsg)
 			err = -EINVAL;
 			SNDERR("Bogus message type %d - name %d"
 					" received from audio service",
-					inmsg->type, inmsg->name);
+					rsp->type, rsp->name);
 		}
 
 	}
+
+finished:
+	/*
+	 * Now copy the data over to inmsg if data was received in
+	 * error structure.
+	 */
+	if (rsp != inmsg)
+		memcpy(inmsg, rsp, length);
 
 	return err;
 }
@@ -1592,7 +2073,6 @@ static int audioservice_recv(int sk, bt_audio_msg_header_t *inmsg)
 static int audioservice_expect(int sk, bt_audio_msg_header_t *rsp,
 							int expected_name)
 {
-	bt_audio_error_t *error;
 	int err = audioservice_recv(sk, rsp);
 
 	if (err != 0)
@@ -1603,15 +2083,6 @@ static int audioservice_expect(int sk, bt_audio_msg_header_t *rsp,
 		SNDERR("Bogus message %s received while %s was expected",
 				bt_audio_strname(rsp->name),
 				bt_audio_strname(expected_name));
-	}
-
-	if (rsp->type == BT_ERROR) {
-		error = (void *) rsp;
-		SNDERR("%s failed : %s(%d)",
-					bt_audio_strname(rsp->name),
-					strerror(error->posix_errno),
-					error->posix_errno);
-		return -error->posix_errno;
 	}
 
 	return err;
@@ -1654,6 +2125,7 @@ static int bluetooth_init(struct bluetooth_data *data,
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_get_capabilities_req *req = (void *) buf;
 	struct bt_get_capabilities_rsp *rsp = (void *) buf;
+	struct timeval tv = {.tv_sec = RECV_TIMEOUT};
 
 	memset(data, 0, sizeof(struct bluetooth_data));
 
@@ -1667,6 +2139,13 @@ static int bluetooth_init(struct bluetooth_data *data,
 	sk = bt_audio_service_open();
 	if (sk <= 0) {
 		err = -errno;
+		goto failed;
+	}
+
+	if (setsockopt(sk, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv)) < 0) {
+		err = -errno;
+		SNDERR("%s: Cannot set timeout: %s (%d)\n",
+			__FUNCTION__, strerror(errno), errno);
 		goto failed;
 	}
 
@@ -1688,6 +2167,19 @@ static int bluetooth_init(struct bluetooth_data *data,
 		err = -errno;
 		goto failed;
 	}
+
+	/* Needed for Watcher */
+	if (pthread_cond_init(&data->cond, NULL) < 0) {
+		DBG("Can not init cond");
+		data->watcher = -1;
+	}
+
+	if (pthread_mutex_init(&data->mut, NULL) < 0) {
+		DBG("Can not init mutex");
+		data->watcher = -1;
+	}
+
+	data->a2dp_stream_state = STREAM_CLOSED;
 
 	memset(req, 0, BT_SUGGESTED_BUFFER_SIZE);
 	req->h.type = BT_REQUEST;
@@ -1722,6 +2214,42 @@ failed:
 	return err;
 }
 
+static struct bluetooth_data* bluetooth_find_outstanding_data(snd_config_t *conf)
+{
+	struct bluetooth_alsa_config *alsa_conf;
+	struct bluetooth_alsa_config new_alsa_conf;
+	struct bluetooth_data *data;
+	struct data_list *elem = outstanding_data;
+
+	if (!elem)
+		return NULL;
+
+	do {
+		data = elem->data;
+
+		alsa_conf = &data->alsa_config;
+		if (bluetooth_parse_config(conf, &new_alsa_conf) < 0)
+			return NULL;
+
+		/*
+		* Check if the a2dp stream is opened for the same remote device
+		* as plugin.
+		*/
+		if (strcmp(alsa_conf->device, new_alsa_conf.device) == 0 &&
+			new_alsa_conf.transport == alsa_conf->transport) {
+
+			bluetooth_kill_watcher(data);
+			remove_outstanding_data(data);
+			return data;
+		}
+
+		elem = elem->next;
+
+	} while (elem);
+
+	return NULL;
+}
+
 SND_PCM_PLUGIN_DEFINE_FUNC(bluetooth);
 
 SND_PCM_PLUGIN_DEFINE_FUNC(bluetooth)
@@ -1731,6 +2259,14 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluetooth)
 
 	DBG("Bluetooth PCM plugin (%s)",
 		stream == SND_PCM_STREAM_PLAYBACK ? "Playback" : "Capture");
+
+	/*
+	* Check if stream is already opened.
+	* Might happen in e.g. music forward scenario.
+	*/
+	data = bluetooth_find_outstanding_data(conf);
+	if (data)
+		goto create_plugin;
 
 	data = malloc(sizeof(struct bluetooth_data));
 	if (!data) {
@@ -1756,6 +2292,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluetooth)
 			&bluetooth_hsp_playback :
 			&bluetooth_hsp_capture;
 
+create_plugin:
 	err = snd_pcm_ioplug_create(&data->io, name, stream, mode);
 	if (err < 0)
 		goto error;

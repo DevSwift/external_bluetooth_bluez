@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -20,6 +21,12 @@
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  *
  */
+#ifdef ANDROID
+#define LOG_TAG "Bluez"
+#include <utils/Log.h>
+#else
+#define ALOGV(...) ((void) 0)
+#endif
 
 void info(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void error(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -32,10 +39,17 @@ void __btd_toggle_debug(void);
 
 struct btd_debug_desc {
 	const char *file;
-#define BTD_DEBUG_FLAG_DEFAULT (1)
+#define BTD_DEBUG_FLAG_DEFAULT (0)
 #define BTD_DEBUG_FLAG_PRINT   (1 << 0)
 	unsigned int flags;
 } __attribute__((aligned(8)));
+
+void __btd_enable_debug(struct btd_debug_desc *start,
+					struct btd_debug_desc *stop);
+
+#ifndef DEBUG_SECTION
+#define DEBUG_SECTION
+#endif
 
 /**
  * DBG:
@@ -47,10 +61,12 @@ struct btd_debug_desc {
  */
 #define DBG(fmt, arg...) do { \
 	static struct btd_debug_desc __btd_debug_desc \
-	__attribute__((used, section("__debug"), aligned(8))) = { \
+	__attribute__((used, section("__debug"DEBUG_SECTION), aligned(8))) = { \
 		.file = __FILE__, .flags = BTD_DEBUG_FLAG_DEFAULT, \
 	}; \
-	if (__btd_debug_desc.flags & BTD_DEBUG_FLAG_PRINT) \
+	if (__btd_debug_desc.flags & BTD_DEBUG_FLAG_PRINT) {\
 		btd_debug("%s:%s() " fmt,  __FILE__, __FUNCTION__ , ## arg); \
+		ALOGV("%s:%s()" fmt, __FILE__, __func__, ##arg); \
+	} \
 } while (0)
 

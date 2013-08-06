@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2012 Sony Mobile Communications AB
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -17,6 +18,9 @@
  *  You should have received a copy of the GNU General Public License
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
+ *  NOTE: This file has been modified by Sony Mobile Communications AB.
+ *  Modifications are licensed under the License.
  *
  */
 
@@ -40,6 +44,7 @@
 
 #include <glib.h>
 
+#include "glib-compat.h"
 #include "hcid.h"
 #include "sdpd.h"
 #include "btio.h"
@@ -52,6 +57,7 @@
 #include "manager.h"
 #include "oob.h"
 #include "eir.h"
+#include "../audio/ste-qos.h"
 
 #define DISCOV_HALTED 0
 #define DISCOV_INQ 1
@@ -841,7 +847,8 @@ static void bonding_complete(struct dev_info *dev, struct bt_conn *conn,
 	btd_event_bonding_complete(&dev->bdaddr, &conn->bdaddr, status);
 }
 
-static int get_auth_info(int index, bdaddr_t *bdaddr, uint8_t *auth)
+static int get_auth_info(int index, bdaddr_t *bdaddr, uint8_t *auth,
+							uint8_t *sec_level)
 {
 	struct dev_info *dev = &devs[index];
 	struct hci_auth_info_req req;
@@ -859,6 +866,9 @@ static int get_auth_info(int index, bdaddr_t *bdaddr, uint8_t *auth)
 	if (auth)
 		*auth = req.type;
 
+	if (sec_level)
+		*sec_level = req.sec_level;
+
 	return 0;
 }
 
@@ -871,6 +881,7 @@ static void link_key_request(int index, bdaddr_t *dba)
 	struct bt_conn *conn;
 	GSList *match;
 	char da[18];
+	uint8_t sec_level;
 
 	ba2str(dba, da);
 	DBG("hci%d dba %s", index, da);
@@ -879,7 +890,7 @@ static void link_key_request(int index, bdaddr_t *dba)
 	if (conn->handle == 0)
 		conn->secmode3 = TRUE;
 
-	get_auth_info(index, dba, &conn->loc_auth);
+	get_auth_info(index, dba, &conn->loc_auth, &sec_level);
 
 	DBG("kernel auth requirements = 0x%02x", conn->loc_auth);
 
@@ -908,7 +919,12 @@ static void link_key_request(int index, bdaddr_t *dba)
 						(conn->loc_auth & 0x01))
 		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_LINK_KEY_NEG_REPLY,
 								6, dba);
-	else {
+	else if (key_info->type == 0x00 &&
+				sec_level == BT_SECURITY_HIGH &&
+				key_info->pin_len <16) {
+		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_LINK_KEY_NEG_REPLY,
+								6, dba);
+	} else {
 		link_key_reply_cp lr;
 
 		memcpy(lr.link_key, key_info->key, 16);
@@ -1123,6 +1139,21 @@ static void user_confirm_request(int index, void *ptr)
 		}
 	}
 
+	/* If neither side requires no bonding ask the user for
+	 * confirmation. */
+	if (!conn->bonding_initiator &&(conn->loc_auth > 0x01) &&
+			(conn->loc_auth != 0xff) &&
+			(conn->rem_auth > 0x01)) {
+		if (loc_mitm || rem_mitm) {
+			if (btd_event_user_confirm(&dev->bdaddr, &req->bdaddr,
+					btohl(req->passkey)) == 0)
+				return;
+		} else {
+			if (btd_event_user_consent(&dev->bdaddr, &req->bdaddr) == 0)
+				return;
+		}
+	}
+
 	/* If no side requires MITM protection; auto-accept */
 	if ((conn->loc_auth == 0xff || !loc_mitm || conn->rem_cap == 0x03) &&
 					(!rem_mitm || conn->loc_cap == 0x03)) {
@@ -1217,7 +1248,7 @@ static int get_io_cap(int index, bdaddr_t *bdaddr, uint8_t *cap, uint8_t *auth)
 	if (conn == NULL)
 		return -ENOENT;
 
-	err = get_auth_info(index, bdaddr, &conn->loc_auth);
+	err = get_auth_info(index, bdaddr, &conn->loc_auth, NULL);
 	if (err < 0)
 		return err;
 
@@ -1920,8 +1951,8 @@ static inline void inquiry_result(int index, int plen, void *ptr)
 						(info->dev_class[1] << 8) |
 						(info->dev_class[2] << 16);
 
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, class,
-								0, NULL);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					ADDR_TYPE_BREDR, class, 0, 0, NULL, 0);
 		ptr += INQUIRY_INFO_SIZE;
 	}
 }
@@ -1943,7 +1974,8 @@ static inline void inquiry_result_with_rssi(int index, int plen, void *ptr)
 						| (info->dev_class[2] << 16);
 
 			btd_event_device_found(&dev->bdaddr, &info->bdaddr,
-						class, info->rssi, NULL);
+						ADDR_TYPE_BREDR, class,
+						info->rssi, 0, NULL, 0);
 			ptr += INQUIRY_INFO_WITH_RSSI_AND_PSCAN_MODE_SIZE;
 		}
 	} else {
@@ -1954,7 +1986,8 @@ static inline void inquiry_result_with_rssi(int index, int plen, void *ptr)
 						| (info->dev_class[2] << 16);
 
 			btd_event_device_found(&dev->bdaddr, &info->bdaddr,
-						class, info->rssi, NULL);
+						ADDR_TYPE_BREDR, class,
+						info->rssi, 0, NULL, 0);
 			ptr += INQUIRY_INFO_WITH_RSSI_SIZE;
 		}
 	}
@@ -1972,8 +2005,9 @@ static inline void extended_inquiry_result(int index, int plen, void *ptr)
 					| (info->dev_class[1] << 8)
 					| (info->dev_class[2] << 16);
 
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, class,
-						info->rssi, info->data);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					ADDR_TYPE_BREDR, class, info->rssi,
+					0, info->data, HCI_MAX_EIR_LENGTH);
 		ptr += EXTENDED_INQUIRY_INFO_SIZE;
 	}
 }
@@ -2189,6 +2223,17 @@ static inline void conn_request(int index, void *ptr)
 	btd_event_remote_class(&dev->bdaddr, &evt->bdaddr, class);
 }
 
+static inline addr_type_t le_addr_type(uint8_t bdaddr_type)
+{
+	switch (bdaddr_type) {
+	case LE_RANDOM_ADDRESS:
+		return ADDR_TYPE_LE_RANDOM;
+	case LE_PUBLIC_ADDRESS:
+	default:
+		return ADDR_TYPE_LE_PUBLIC;
+	}
+}
+
 static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 {
 	struct dev_info *dev = &devs[index];
@@ -2201,10 +2246,9 @@ static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 	info = (le_advertising_info *) &meta->data[1];
 	rssi = *(info->data + info->length);
 
-	memset(eir, 0, sizeof(eir));
-	memcpy(eir, info->data, info->length);
-
-	btd_event_device_found(&dev->bdaddr, &info->bdaddr, 0, rssi, eir);
+	btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+				le_addr_type(info->bdaddr_type), 0, rssi, 0,
+				info->data, info->length);
 
 	num_reports--;
 
@@ -2213,11 +2257,9 @@ static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 								RSSI_SIZE);
 		rssi = *(info->data + info->length);
 
-		memset(eir, 0, sizeof(eir));
-		memcpy(eir, info->data, info->length);
-
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, 0, rssi,
-									eir);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					le_addr_type(info->bdaddr_type),
+					0, rssi, 0, info->data, info->length);
 	}
 }
 
@@ -3289,12 +3331,22 @@ static int hciops_pincode_reply(int index, bdaddr_t *bdaddr, const char *pin,
 	struct dev_info *dev = &devs[index];
 	char addr[18];
 	int err;
+	uint8_t sec_level = 0;
+
+	if (get_auth_info(index, bdaddr, NULL, &sec_level) < 0)
+		DBG("Could not get auth info");
 
 	ba2str(bdaddr, addr);
 	DBG("hci%d dba %s", index, addr);
 
 	if (pin) {
 		pin_code_reply_cp pr;
+
+		if (sec_level == BT_SECURITY_HIGH && pin_len < 16) {
+			err = hci_send_cmd(dev->sk, OGF_LINK_CTL,
+					OCF_PIN_CODE_NEG_REPLY, 6, bdaddr);
+			goto done;
+		}
 
 		dev->pin_length = pin_len;
 
@@ -3309,6 +3361,7 @@ static int hciops_pincode_reply(int index, bdaddr_t *bdaddr, const char *pin,
 		err = hci_send_cmd(dev->sk, OGF_LINK_CTL,
 					OCF_PIN_CODE_NEG_REPLY, 6, bdaddr);
 
+done:
 	if (err < 0)
 		err = -errno;
 
@@ -3557,7 +3610,7 @@ failed:
 static int hciops_create_bonding(int index, bdaddr_t *bdaddr, uint8_t io_cap)
 {
 	struct dev_info *dev = &devs[index];
-	BtIOSecLevel sec_level;
+	BtIOSecLevel sec_level = BT_IO_SEC_MEDIUM;
 	struct bt_conn *conn;
 	GError *err = NULL;
 
@@ -3567,15 +3620,6 @@ static int hciops_create_bonding(int index, bdaddr_t *bdaddr, uint8_t io_cap)
 		return -EBUSY;
 
 	conn->loc_cap = io_cap;
-
-	/* If our IO capability is NoInputNoOutput use medium security
-	 * level (i.e. don't require MITM protection) else use high
-	 * security level */
-	if (io_cap == 0x03)
-		sec_level = BT_IO_SEC_MEDIUM;
-	else
-		sec_level = BT_IO_SEC_HIGH;
-
 	conn->io = bt_io_connect(BT_IO_L2RAW, bonding_connect_cb, conn,
 					NULL, &err,
 					BT_IO_OPT_SOURCE_BDADDR, &dev->bdaddr,
@@ -3671,11 +3715,33 @@ static int hciops_remove_remote_oob_data(int index, bdaddr_t *bdaddr)
 	return 0;
 }
 
+static int get_role(int dd, const bdaddr_t *ba, int *role)
+{
+        struct hci_conn_info_req *cr;
+        uint8_t buf[sizeof(*cr) + sizeof(struct hci_conn_info)];
+
+        cr = (struct hci_conn_info_req *) buf;
+
+        bacpy(&cr->bdaddr, ba);
+        cr->type = ACL_LINK;
+
+        if (ioctl(dd, HCIGETCONNINFO, (unsigned long int)cr) < 0)
+                return -errno;
+
+        if (cr->conn_info->link_mode & HCI_LM_MASTER)
+                *role = 1;
+        else
+                *role = 0;
+
+        return 0;
+}
+
 static int hciops_set_link_timeout(int index, bdaddr_t *bdaddr, uint32_t num_slots)
 {
 	int dd, err;
 	uint16_t handle;
 	char addr[18];
+	int master;
 
 	ba2str(bdaddr, addr);
 	DBG("hci%d, addr %s, num_slots %d", index, bdaddr, num_slots);
@@ -3683,14 +3749,29 @@ static int hciops_set_link_timeout(int index, bdaddr_t *bdaddr, uint32_t num_slo
 	dd = hci_open_dev(index);
 
 	if (dd < 0)
-		return EIO;
+		return -EIO;
 
-	handle = get_handle(index, bdaddr, &handle);
-	err = hci_write_link_supervision_timeout(dd, htobs(handle),
-			htobs(num_slots), 1000);
+	err = get_handle(index, bdaddr, &handle);
 	if (err < 0)
-		err = -errno;
+		goto close;
 
+	err = get_role(dd, bdaddr, &master);
+	if (err < 0) {
+		error("Setting link supervision timeout failed: can't get role");
+		goto close;
+	}
+
+	if (master) {
+		err = hci_write_link_supervision_timeout(dd, htobs(handle),
+			htobs(num_slots), 1000);
+		if (err < 0)
+			err = -errno;
+	} else {
+		error("Setting link supervision timeout failed: can't be a slave");
+		err = -EPERM;
+	}
+
+close:
 	hci_close_dev(dd);
 
 	return err;
@@ -3699,6 +3780,124 @@ static int hciops_set_link_timeout(int index, bdaddr_t *bdaddr, uint32_t num_slo
 static int hciops_retry_authentication(int index, bdaddr_t *bdaddr)
 {
 	return request_authentication(index, bdaddr);
+}
+
+static int hciops_set_qos(int index, bdaddr_t *bdaddr,
+						struct ste_qos_params *params)
+{
+	int dd, err = 0;
+	uint16_t handle;
+	char addr[18];
+	int master;
+	uint8_t status;
+
+	dd = hci_open_dev(index);
+	if (dd < 0)
+		return -EIO;
+
+	err = get_handle(index, bdaddr, &handle);
+	if (err < 0) {
+		error("Setting QoS failed: can't get handle");
+		goto close;
+	}
+
+	err = get_role(dd, bdaddr, &master);
+	if (err < 0) {
+		error("Setting QoS failed: can't get role");
+		goto close;
+	}
+
+	ba2str(bdaddr, addr);
+
+	/* Use vendor flow spec if master on link */
+	if (master) {
+		info("Setting VS QoS for %s (%04X %d %d %d 0x%02X %d)",
+				addr, handle,
+				params->service_interval,
+				params->out_service_window,
+				params->in_service_window,
+				params->cqae,
+				params->packet_size);
+
+		err = hci_vs_ext_flow_spec(dd, handle,
+					params->service_interval,
+					params->out_service_window,
+					params->in_service_window,
+					params->cqae,
+					params->packet_size,
+					&status, 1000);
+	} else {
+		info("Setting QoS for %s (%04X %d %d %02X 0x%02X 0x%02X %d %d",
+				addr, handle,
+				params->token_bucket_size,
+				params->access_latency,
+				params->direction,
+				params->service_type,
+				params->flags,
+				params->token_rate,
+				params->peak_bandwidth);
+
+		err = hci_write_flow_spec(dd, handle,
+					params->token_bucket_size,
+					params->access_latency,
+					params->direction,
+					params->service_type,
+					params->flags,
+					params->token_rate,
+					params->peak_bandwidth,
+					&status, 1000);
+	}
+
+	if (err < 0) {
+		error("Setting QoS failed: status:0x%x", status);
+		err = -errno;
+	}
+
+close:
+	hci_close_dev(dd);
+
+	return err;
+}
+
+int hciops_forbid_role_switch(int index, bdaddr_t *bdaddr)
+{
+	int dd, err = 0;
+	uint16_t handle;
+	uint16_t policy;
+	int master;
+
+	dd = hci_open_dev(index);
+	if (dd < 0)
+		return -EIO;
+
+	err = get_handle(index, bdaddr, &handle);
+	if (err < 0)
+		goto close;
+
+	err = get_role(dd, bdaddr, &master);
+	if (err < 0)
+		goto close;
+
+	/* Forbid role switch only if master on link */
+	if (!master)
+		goto close;
+
+	if (hci_read_link_policy(dd, handle, &policy, 1000) < 0) {
+		err = -errno;
+		goto close;
+	}
+
+	/* Change the Link Policy if Role Switch is enabled. */
+	if (policy & HCI_LP_RSWITCH) {
+		policy &= ~HCI_LP_RSWITCH;
+		if (hci_write_link_policy(dd, handle, policy, 1000) < 0)
+			err = -errno;
+	}
+
+close:
+	hci_close_dev(dd);
+
+	return err;
 }
 
 static struct btd_adapter_ops hci_ops = {
@@ -3742,6 +3941,8 @@ static struct btd_adapter_ops hci_ops = {
 	.remove_remote_oob_data = hciops_remove_remote_oob_data,
 	.set_link_timeout = hciops_set_link_timeout,
 	.retry_authentication = hciops_retry_authentication,
+	.set_qos = hciops_set_qos,
+	.forbid_role_switch = hciops_forbid_role_switch,
 };
 
 static int hciops_init(void)
